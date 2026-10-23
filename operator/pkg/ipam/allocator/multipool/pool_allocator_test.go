@@ -1046,3 +1046,116 @@ func TestPoolAllocator_ReleasedCIDRRemainsReserved(t *testing.T) {
 	err = p.AllocateToNode("node3", request)
 	require.ErrorIs(t, err, errPoolEmpty)
 }
+
+func TestOrphanPoolLifecycle_CleanupWhenUnrequested(t *testing.T) {
+	p := NewPoolAllocator(hivetest.Logger(t), true, true)
+	p.RestoreFinished()
+
+	// 1. Creation: create pool with v4 and v6 CIDRs
+	err := p.UpsertPool("test-pool",
+		[]poolCIDRConfig{{cidr: netip.MustParsePrefix("10.100.0.0/16")}}, 24,
+		[]poolCIDRConfig{{cidr: netip.MustParsePrefix("fd00:100::/80")}}, 96,
+	)
+	require.NoError(t, err)
+
+	// 2. Allocation: node requests allocation from test-pool
+	nodeSpec := ipamTypes.IPAMPoolSpec{
+		Requested: []ipamTypes.IPAMPoolRequest{request("test-pool", 10, 10)},
+	}
+	err = p.AllocateToNode("node1", nodeSpec)
+	require.NoError(t, err)
+
+	allocated := p.AllocatedPools("node1")
+	require.Len(t, allocated, 1)
+	require.Equal(t, "test-pool", allocated[0].Pool)
+	require.Len(t, allocated[0].CIDRs, 2) // 1 v4, 1 v6
+
+	// 3. Pool deletion: test-pool is deleted while node still has allocations
+	err = p.DeletePool("test-pool")
+	require.NoError(t, err)
+
+	// CIDRs are marked as orphans to avoid disrupting workloads
+	require.Empty(t, p.nodes["node1"])
+	require.Len(t, p.orphans["node1"]["test-pool"].v4, 1)
+	require.Len(t, p.orphans["node1"]["test-pool"].v6, 1)
+	require.Len(t, p.AllocatedPools("node1"), 1)
+
+	// 4. Node unallocation/cleanup: node clears its requested allocations (Requested = [])
+	// but Allocated still has test-pool
+	unrequestedSpec := ipamTypes.IPAMPoolSpec{
+		Requested: []ipamTypes.IPAMPoolRequest{},
+		Allocated: allocated,
+	}
+	err = p.AllocateToNode("node1", unrequestedSpec)
+	// Must succeed without error (no "unable to find pool ..., prefix ... is still allocated to the node but is marked as orphan")
+	require.NoError(t, err)
+
+	// Orphan allocations must be gracefully released and cleared
+	require.Empty(t, p.orphans)
+	require.Empty(t, p.AllocatedPools("node1"))
+}
+
+func TestReleaseNode_CleansUpOrphans(t *testing.T) {
+	p := NewPoolAllocator(hivetest.Logger(t), true, false)
+	p.RestoreFinished()
+
+	err := p.UpsertPool("test-pool",
+		[]poolCIDRConfig{{cidr: netip.MustParsePrefix("10.0.0.0/24")}}, 28,
+		nil, 0)
+	require.NoError(t, err)
+
+	err = p.AllocateToNode("node1", ipamTypes.IPAMPoolSpec{
+		Requested: []ipamTypes.IPAMPoolRequest{request("test-pool", 10, 0)},
+	})
+	require.NoError(t, err)
+
+	err = p.DeletePool("test-pool")
+	require.NoError(t, err)
+	require.NotEmpty(t, p.orphans["node1"])
+
+	// Deleting the node must clean up orphan tracking
+	err = p.ReleaseNode("node1")
+	require.NoError(t, err)
+	require.Empty(t, p.orphans)
+}
+
+func TestOrphanPoolLifecycle_MultiplePools(t *testing.T) {
+	p := NewPoolAllocator(hivetest.Logger(t), true, false)
+	p.RestoreFinished()
+
+	require.NoError(t, p.UpsertPool("pool-active",
+		[]poolCIDRConfig{{cidr: netip.MustParsePrefix("10.1.0.0/24")}}, 28, nil, 0))
+	require.NoError(t, p.UpsertPool("pool-deleted",
+		[]poolCIDRConfig{{cidr: netip.MustParsePrefix("10.2.0.0/24")}}, 28, nil, 0))
+
+	err := p.AllocateToNode("node1", ipamTypes.IPAMPoolSpec{
+		Requested: []ipamTypes.IPAMPoolRequest{
+			request("pool-active", 10, 0),
+			request("pool-deleted", 10, 0),
+		},
+	})
+	require.NoError(t, err)
+
+	allocated := p.AllocatedPools("node1")
+	require.Len(t, allocated, 2)
+
+	// Delete pool-deleted
+	require.NoError(t, p.DeletePool("pool-deleted"))
+	require.NotEmpty(t, p.orphans["node1"]["pool-deleted"])
+
+	// Node unrequests pool-deleted, but keeps pool-active
+	err = p.AllocateToNode("node1", ipamTypes.IPAMPoolSpec{
+		Requested: []ipamTypes.IPAMPoolRequest{
+			request("pool-active", 10, 0),
+		},
+		Allocated: allocated,
+	})
+	require.NoError(t, err)
+
+	// pool-deleted is cleaned up, pool-active remains allocated
+	require.Empty(t, p.orphans)
+	remainingAllocated := p.AllocatedPools("node1")
+	require.Len(t, remainingAllocated, 1)
+	require.Equal(t, "pool-active", remainingAllocated[0].Pool)
+}
+

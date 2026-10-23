@@ -685,3 +685,205 @@ func TestNodeHandlerRetries(t *testing.T) {
 		assert.Empty(t, updatedNode.Status.IPAM.OperatorStatus.Error)
 	})
 }
+
+func TestOrphanPoolCleanupLifecycle(t *testing.T) {
+	t.Cleanup(func() { testutils.GoleakVerifyNone(t) })
+
+	backend := NewPoolAllocator(hivetest.Logger(t), true, false)
+	err := backend.UpsertPool("test-pool",
+		[]poolCIDRConfig{
+			{cidr: netip.MustParsePrefix("10.0.0.0/28")},
+			{cidr: netip.MustParsePrefix("10.0.0.16/28")},
+		}, 28,
+		nil, 0)
+	assert.NoError(t, err)
+
+	onUpdateArgs := make(chan mockArgs, 5)
+	onUpdateResult := make(chan mockResult, 5)
+	onUpdateStatusArgs := make(chan mockArgs, 5)
+	onUpdateStatusResult := make(chan mockResult, 5)
+
+	nodeUpdater := &k8sNodeMock{
+		OnUpdate: func(ctx context.Context, ciliumNode *v2.CiliumNode, opts v1.UpdateOptions) (*v2.CiliumNode, error) {
+			onUpdateArgs <- mockArgs{ciliumNode.DeepCopy()}
+			r := <-onUpdateResult
+			return r.node, r.err
+		},
+		OnUpdateStatus: func(ctx context.Context, ciliumNode *v2.CiliumNode, opts v1.UpdateOptions) (*v2.CiliumNode, error) {
+			onUpdateStatusArgs <- mockArgs{ciliumNode.DeepCopy()}
+			r := <-onUpdateStatusResult
+			return r.node, r.err
+		},
+	}
+	nh := NewNodeHandler(
+		"test", hivetest.Logger(t), backend, nodeUpdater,
+		ipam.MultiPoolAccessor,
+		ipam.MultiPoolStatusAccessor,
+	)
+	nh.controllerErrorRetryBaseDuration = 1 * time.Millisecond
+	t.Cleanup(nh.Stop)
+
+	node := &v2.CiliumNode{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node",
+		},
+		Spec: v2.NodeSpec{
+			IPAM: ipamTypes.IPAMSpec{
+				Pools: ipamTypes.IPAMPoolSpec{
+					Requested: []ipamTypes.IPAMPoolRequest{
+						{
+							Pool:   "test-pool",
+							Needed: ipamTypes.IPAMPoolDemand{IPv4Addrs: 24},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// 1. Allocation phase: Upsert node and resync to finish restore
+	nh.Upsert(node)
+	nh.Resync(t.Context(), time.Time{})
+
+	// Wait for node to be allocated CIDRs from test-pool
+	nodeUpdate1 := <-onUpdateArgs
+	assert.Equal(t, node.Name, nodeUpdate1.node.Name)
+	assert.Len(t, nodeUpdate1.node.Spec.IPAM.Pools.Allocated, 1)
+	assert.Equal(t, "test-pool", nodeUpdate1.node.Spec.IPAM.Pools.Allocated[0].Pool)
+	onUpdateResult <- mockResult{node: nodeUpdate1.node}
+
+	assert.NotEmpty(t, backend.nodes[node.Name]["test-pool"].v4)
+	assert.Empty(t, backend.orphans)
+
+	// 2. Pool deletion phase: Delete test-pool from cluster
+	err = DeletePool(backend, "test-pool")
+	assert.NoError(t, err)
+
+	// Previously allocated CIDRs are now tracked as orphans to preserve node workloads
+	backend.mutex.Lock()
+	assert.NotEmpty(t, backend.orphans[node.Name]["test-pool"].v4)
+	assert.Empty(t, backend.nodes[node.Name])
+	backend.mutex.Unlock()
+
+	// 2.5 Error reporting phase: while deleted pool is still requested,
+	// controller attempts allocation and writes orphan error to status.
+	nh.Upsert(nodeUpdate1.node)
+	statusUpdate1 := <-onUpdateStatusArgs
+	assert.Contains(t, statusUpdate1.node.Status.IPAM.OperatorStatus.Error, "unable to find pool test-pool")
+	onUpdateStatusResult <- mockResult{node: statusUpdate1.node}
+
+	// 3. Node unallocation/cleanup phase:
+	// Worker node clears its requested allocations (Requested = []).
+	// Its spec in Kubernetes still contains the previous Allocated pool,
+	// and its status in Kubernetes contains the previous error.
+	node2 := nodeUpdate1.node.DeepCopy()
+	node2.Spec.IPAM.Pools.Requested = []ipamTypes.IPAMPoolRequest{}
+	node2.Status = statusUpdate1.node.Status
+	node2.SetResourceVersion("2")
+	nh.Upsert(node2)
+
+	// The operator should update the node spec to remove the deleted orphan pool from Allocated
+	nodeUpdate2 := <-onUpdateArgs
+	assert.Equal(t, node.Name, nodeUpdate2.node.Name)
+	assert.Empty(t, nodeUpdate2.node.Spec.IPAM.Pools.Allocated)
+	onUpdateResult <- mockResult{node: nodeUpdate2.node}
+
+	// Backend orphans must be completely cleaned up
+	backend.mutex.Lock()
+	assert.Empty(t, backend.orphans)
+	backend.mutex.Unlock()
+
+	// Ensure the error was cleared in operator status
+	statusUpdate2 := <-onUpdateStatusArgs
+	assert.Empty(t, statusUpdate2.node.Status.IPAM.OperatorStatus.Error)
+	onUpdateStatusResult <- mockResult{node: statusUpdate2.node}
+
+	// Ensure controller has settled and is not in an infinite retry loop
+	select {
+	case unexpected := <-onUpdateArgs:
+		t.Fatalf("Unexpected further update: %+v", unexpected.node.Spec.IPAM.Pools)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestOrphanPoolRestartUnrequested(t *testing.T) {
+	t.Cleanup(func() { testutils.GoleakVerifyNone(t) })
+
+	// Operator starts without test-pool
+	backend := NewPoolAllocator(hivetest.Logger(t), true, false)
+
+	onUpdateArgs := make(chan mockArgs, 5)
+	onUpdateResult := make(chan mockResult, 5)
+	onUpdateStatusArgs := make(chan mockArgs, 5)
+	onUpdateStatusResult := make(chan mockResult, 5)
+
+	nodeUpdater := &k8sNodeMock{
+		OnUpdate: func(ctx context.Context, ciliumNode *v2.CiliumNode, opts v1.UpdateOptions) (*v2.CiliumNode, error) {
+			onUpdateArgs <- mockArgs{ciliumNode.DeepCopy()}
+			r := <-onUpdateResult
+			return r.node, r.err
+		},
+		OnUpdateStatus: func(ctx context.Context, ciliumNode *v2.CiliumNode, opts v1.UpdateOptions) (*v2.CiliumNode, error) {
+			onUpdateStatusArgs <- mockArgs{ciliumNode.DeepCopy()}
+			r := <-onUpdateStatusResult
+			return r.node, r.err
+		},
+	}
+	nh := NewNodeHandler(
+		"test", hivetest.Logger(t), backend, nodeUpdater,
+		ipam.MultiPoolAccessor,
+		ipam.MultiPoolStatusAccessor,
+	)
+	nh.controllerErrorRetryBaseDuration = 1 * time.Millisecond
+	t.Cleanup(nh.Stop)
+
+	// Node arrives with deleted pool in Allocated, but Requested is empty
+	node := &v2.CiliumNode{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node",
+		},
+		Spec: v2.NodeSpec{
+			IPAM: ipamTypes.IPAMSpec{
+				Pools: ipamTypes.IPAMPoolSpec{
+					Requested: []ipamTypes.IPAMPoolRequest{},
+					Allocated: []ipamTypes.IPAMPoolAllocation{
+						{
+							Pool: "test-pool",
+							CIDRs: []iputil.Prefix{
+								iputil.PrefixFrom(netip.MustParsePrefix("10.0.0.0/28")),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	nh.Upsert(node)
+	nh.Resync(t.Context(), time.Time{})
+
+	// Operator should clean up the orphan pool from Allocated without entering an error loop
+	nodeUpdate := <-onUpdateArgs
+	assert.Equal(t, node.Name, nodeUpdate.node.Name)
+	assert.Empty(t, nodeUpdate.node.Spec.IPAM.Pools.Allocated)
+	onUpdateResult <- mockResult{node: nodeUpdate.node}
+
+	backend.mutex.Lock()
+	assert.Empty(t, backend.orphans)
+	backend.mutex.Unlock()
+
+	// Ensure no errors were written to operator status
+	select {
+	case statusUpdate := <-onUpdateStatusArgs:
+		assert.Empty(t, statusUpdate.node.Status.IPAM.OperatorStatus.Error)
+		onUpdateStatusResult <- mockResult{node: statusUpdate.node}
+	default:
+	}
+
+	select {
+	case unexpected := <-onUpdateArgs:
+		t.Fatalf("Unexpected further update: %+v", unexpected.node.Spec.IPAM.Pools)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+

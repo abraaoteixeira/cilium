@@ -487,16 +487,26 @@ func (p *PoolAllocator) AllocateToNode(nodeName string, pools types.IPAMPoolSpec
 				if occupyErr := p.occupyCIDR(nodeName, allocatedPool.Pool, prefix); occupyErr != nil {
 					err = errors.Join(err, occupyErr)
 				}
-			} else {
+				allocatedSet[allocatedPool.Pool][prefix] = struct{}{}
+			} else if isPoolRequested(pools.Requested, allocatedPool.Pool) {
 				// pool cannot be found: it must be a pool deleted before the operator restarted.
 				// Mark the CIDR as orphan to preserve node allocations.
 				p.markOrphan(nodeName, allocatedPool.Pool, prefix, allocatedPool.AllowFirstIP, allocatedPool.AllowLastIP)
 				err = errors.Join(err,
 					fmt.Errorf("unable to find pool %s, prefix %s is still allocated to the node but is marked as orphan",
 						allocatedPool.Pool, prefix))
+				allocatedSet[allocatedPool.Pool][prefix] = struct{}{}
+			} else {
+				// pool is deleted and unrequested by the node: gracefully clean up and release
+				// the orphan CIDR allocation so it is removed from the node's allocated pools.
+				_ = p.releaseOrphanCIDR(nodeName, allocatedPool.Pool, prefix)
 			}
+		}
+	}
 
-			allocatedSet[allocatedPool.Pool][prefix] = struct{}{}
+	for poolName, set := range allocatedSet {
+		if len(set) == 0 {
+			delete(allocatedSet, poolName)
 		}
 	}
 
@@ -576,6 +586,7 @@ func (p *PoolAllocator) ReleaseNode(nodeName string) error {
 
 	// Remove bookkeeping for this node
 	delete(p.nodes, nodeName)
+	delete(p.orphans, nodeName)
 
 	return err
 }
@@ -910,4 +921,13 @@ func (p *PoolAllocator) releaseOrphanCIDR(targetNode, sourcePool string, cidr ne
 	p.markReleasedOrphan(targetNode, sourcePool, cidr)
 
 	return nil
+}
+
+func isPoolRequested(requested []types.IPAMPoolRequest, pool string) bool {
+	for _, req := range requested {
+		if req.Pool == pool && (req.Needed.IPv4Addrs > 0 || req.Needed.IPv6Addrs > 0) {
+			return true
+		}
+	}
+	return false
 }
