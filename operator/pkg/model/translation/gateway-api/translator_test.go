@@ -873,3 +873,52 @@ func toYaml(t *testing.T, obj any) string {
 
 	return strings.TrimSpace(string(yamlText))
 }
+
+
+func Test_translator_Translate_DoesNotMutateInfrastructureAnnotations(t *testing.T) {
+	trans := &gatewayAPITranslator{
+		cecTranslator: translation.NewCECTranslator(translation.Config{}),
+	}
+	source := model.FullyQualifiedResource{
+		Name:      "test",
+		Namespace: "default",
+		Kind:      "Gateway",
+		UID:       "uid",
+	}
+
+	infraAnnotations := map[string]string{
+		"service.beta.kubernetes.io/aws-load-balancer-type": "nlb",
+	}
+
+	input := &model.Model{
+		HTTP: []model.HTTPListener{
+			{
+				Name:           "http",
+				Sources:        []model.FullyQualifiedResource{source},
+				Port:           80,
+				Infrastructure: &model.Infrastructure{Annotations: infraAnnotations},
+				Routes: []model.HTTPRoute{
+					{
+						Hostnames: []string{"example.com"},
+						Backends: []model.Backend{
+							{
+								Name:      "echo",
+								Namespace: "default",
+								Port:      &model.BackendPort{Port: 8080},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, svc, _, err := trans.Translate(input)
+	require.NoError(t, err)
+	require.NotNil(t, svc)
+
+	assert.Equal(t, "nlb", svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-type"])
+	assert.Equal(t, map[string]string{
+		"service.beta.kubernetes.io/aws-load-balancer-type": "nlb",
+	}, infraAnnotations)
+}

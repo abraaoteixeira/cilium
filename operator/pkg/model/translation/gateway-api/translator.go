@@ -501,7 +501,7 @@ func decorateCEC(cec *ciliumv2.CiliumEnvoyConfig, resource *model.FullyQualified
 
 func mergeMap(left, right map[string]string) map[string]string {
 	if left == nil {
-		return right
+		return maps.Clone(right)
 	}
 	maps.Copy(left, right)
 	return left
