@@ -859,6 +859,19 @@ func (a *Agent) OnIPIdentityCacheChange(modType ipcache.CacheModification, cidrC
 			}
 		}
 	case modType == ipcache.Upsert && newHostIP != nil:
+		// If the prefix migrated directly from an old host to a new host,
+		// remove the allowed IP from the old peer's in-memory set so that
+		// it reflects the kernel's cryptokey routing table update.
+		if oldHostIP != nil && !oldHostIP.Equal(newHostIP) {
+			if oldNodeName, ok := a.nodeNameByNodeIP[oldHostIP.String()]; ok {
+				if oldPeer := a.peerByNodeName[oldNodeName]; oldPeer != nil {
+					oldPeer.allowedIPs.Remove(prefix)
+					oldPeer.needsRemove.Remove(prefix)
+					oldPeer.needsInsert.Remove(prefix)
+				}
+			}
+		}
+
 		if nodeName, ok := a.nodeNameByNodeIP[newHostIP.String()]; ok {
 			if peer := a.peerByNodeName[nodeName]; peer != nil {
 				if !peer.hasAllowedIP(prefix) {

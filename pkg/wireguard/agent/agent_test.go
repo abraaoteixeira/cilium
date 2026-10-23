@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
@@ -569,6 +570,49 @@ func TestAgent_AllowedIPsRestoration(t *testing.T) {
 			require.Error(t, err, "node %q is not allowed to use the dummy peer key", k8s2NodeName)
 		})
 	}
+}
+
+func TestAgent_AllowedIPs_AtomicHostMigration(t *testing.T) {
+	client := newFakeWgClient()
+	agentConfig := Config{
+		UserConfig: UserConfig{
+			EnableConfig: EnableConfig{
+				EnableWireguard: true,
+			},
+		},
+		EnableIPv4:       true,
+		TunnelingEnabled: false,
+	}
+	wgAgent, ipCache := newTestAgent(t.Context(), hivetest.Logger(t), client, agentConfig)
+	defer ipCache.Shutdown()
+
+	require.NoError(t, wgAgent.updatePeer(k8s1NodeName, k8s1PubKey, k8s1NodeIPv4, k8s1NodeIPv6))
+	require.NoError(t, wgAgent.updatePeer(k8s2NodeName, k8s2PubKey, k8s2NodeIPv4, k8s2NodeIPv6))
+
+	cidrCluster := cmtypes.MustParseAddrCluster(pod1IPv4Str).AsPrefixCluster()
+	prefix := cidrCluster.AsPrefix()
+
+	// Step 1: Pod starts on Node 1.
+	wgAgent.OnIPIdentityCacheChange(ipcache.Upsert, cidrCluster, nil, k8s1NodeIPv4, nil, ipcache.Identity{ID: 1}, 0, nil, 0)
+
+	k8s1Peer := wgAgent.peerByNodeName[k8s1NodeName]
+	k8s2Peer := wgAgent.peerByNodeName[k8s2NodeName]
+
+	require.True(t, k8s1Peer.hasAllowedIP(prefix))
+	require.False(t, k8s2Peer.hasAllowedIP(prefix))
+
+	// Step 2: Pod migrates directly from Node 1 to Node 2 (atomic Upsert with oldHostIP and newHostIP).
+	wgAgent.OnIPIdentityCacheChange(ipcache.Upsert, cidrCluster, k8s1NodeIPv4, k8s2NodeIPv4, nil, ipcache.Identity{ID: 1}, 0, nil, 0)
+
+	// Node 1 in-memory AllowedIPs must no longer retain the migrated prefix.
+	require.False(t, k8s1Peer.hasAllowedIP(prefix), "Node 1 must release the AllowedIP in memory when Pod migrates to Node 2")
+	require.True(t, k8s2Peer.hasAllowedIP(prefix), "Node 2 must claim the AllowedIP in memory")
+
+	// Step 3: Pod migrates back from Node 2 to Node 1.
+	wgAgent.OnIPIdentityCacheChange(ipcache.Upsert, cidrCluster, k8s2NodeIPv4, k8s1NodeIPv4, nil, ipcache.Identity{ID: 1}, 0, nil, 0)
+
+	require.True(t, k8s1Peer.hasAllowedIP(prefix), "Node 1 must successfully reclaim the AllowedIP when Pod migrates back")
+	require.False(t, k8s2Peer.hasAllowedIP(prefix), "Node 2 must release the AllowedIP when Pod migrates back to Node 1")
 }
 
 func TestAgent_PeerEndpointSelection(t *testing.T) {
